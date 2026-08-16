@@ -1,0 +1,35 @@
+# Python virtual environment
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Input images
+input/
+
+# Generated output
+output/
+
+# Hugging Face / ML cache
+.cache/
+huggingface/
+models/
+
+# Model weights
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment variables / secrets
+.env
+
+# IDE
+.vscode/
+.idea/
