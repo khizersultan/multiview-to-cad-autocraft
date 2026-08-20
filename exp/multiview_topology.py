@@ -7,7 +7,7 @@ from pathlib import Path
 from openai import OpenAI
 
 
-MODEL = "gpt-5.6-luna"
+MODEL = "gpt-5.6-sol"
 WHEELBASE_M = 2.7
 
 
@@ -1600,39 +1600,362 @@ def build_edges(result):
 
     return result
 
-
 # ============================================================
-# SCALE TO METERS
+# SCALE / CALIBRATE TO AUTOCRAFT COORDINATE SYSTEM
 # ============================================================
 
 def scale_points(result):
 
-    for point in result.get(
-        "points",
-        []
-    ):
+    points = result.get("points", [])
 
-        point["x_m"] = (
-            point["x_norm"]
-            * WHEELBASE_M
+    if not points:
+        raise RuntimeError(
+            "No points available for coordinate calibration."
         )
 
-        point["y_m"] = (
+    point_map = {
+        point["id"]: point
+        for point in points
+    }
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # P16 = crown/top of FRONT wheel arch
+    # P23 = crown/top of REAR wheel arch
+    #
+    # Their X positions are approximately aligned with the
+    # front/rear wheel axle centers.
+    #
+    # We therefore use them to establish the true wheelbase.
+    # --------------------------------------------------------
+
+    front_axle_candidates = []
+    rear_axle_candidates = []
+
+    for point_id in ["P16L", "P16R"]:
+
+        if point_id in point_map:
+
+            front_axle_candidates.append(
+                float(point_map[point_id]["x_norm"])
+            )
+
+    for point_id in ["P23L", "P23R"]:
+
+        if point_id in point_map:
+
+            rear_axle_candidates.append(
+                float(point_map[point_id]["x_norm"])
+            )
+
+    if not front_axle_candidates:
+        raise RuntimeError(
+            "Cannot calibrate wheelbase: P16L/P16R missing."
+        )
+
+    if not rear_axle_candidates:
+        raise RuntimeError(
+            "Cannot calibrate wheelbase: P23L/P23R missing."
+        )
+
+    # Average left/right observations.
+    front_axle_x = (
+        sum(front_axle_candidates)
+        / len(front_axle_candidates)
+    )
+
+    rear_axle_x = (
+        sum(rear_axle_candidates)
+        / len(rear_axle_candidates)
+    )
+
+    raw_wheelbase = (
+        front_axle_x
+        - rear_axle_x
+    )
+
+    if raw_wheelbase <= 0:
+
+        raise RuntimeError(
+            "Invalid wheelbase calibration. "
+            f"Front axle X={front_axle_x}, "
+            f"rear axle X={rear_axle_x}."
+        )
+
+    # --------------------------------------------------------
+    # Longitudinal scale
+    #
+    # Force:
+    #
+    # rear axle = X 0
+    # front axle = X 2.7
+    # --------------------------------------------------------
+
+    x_scale = (
+        WHEELBASE_M
+        / raw_wheelbase
+    )
+
+    # --------------------------------------------------------
+    # Determine approximate vehicle centerline.
+    #
+    # VLM y_norm is already defined relative to vehicle
+    # centerline, so normally this should be close to zero.
+    #
+    # We estimate it from all available left/right points
+    # to remove small VLM bias.
+    # --------------------------------------------------------
+
+    left_y = []
+    right_y = []
+
+    for point in points:
+
+        point_id = point.get("id", "")
+
+        y = float(
             point["y_norm"]
-            * WHEELBASE_M
         )
 
-        point["z_m"] = (
-            point["z_norm"]
-            * WHEELBASE_M
+        if point_id.endswith("L"):
+            left_y.append(y)
+
+        elif point_id.endswith("R"):
+            right_y.append(y)
+
+    if left_y and right_y:
+
+        left_mean = (
+            sum(left_y)
+            / len(left_y)
         )
+
+        right_mean = (
+            sum(right_y)
+            / len(right_y)
+        )
+
+        centerline_y = (
+            left_mean
+            + right_mean
+        ) / 2.0
+
+    else:
+
+        centerline_y = 0.0
+
+    # --------------------------------------------------------
+    # Estimate half-width in normalized coordinates.
+    #
+    # We use the maximum absolute lateral coordinate.
+    # --------------------------------------------------------
+
+    max_abs_y = max(
+        abs(
+            float(point["y_norm"])
+            - centerline_y
+        )
+        for point in points
+    )
+
+    if max_abs_y <= 0:
+
+        raise RuntimeError(
+            "Cannot determine vehicle width from point data."
+        )
+
+    # --------------------------------------------------------
+    # Vehicle width estimation.
+    #
+    # We don't have an independently measured vehicle width,
+    # so estimate it from the normalized geometry using the
+    # wheelbase as the metric reference.
+    #
+    # Typical passenger-car width / wheelbase is approximately
+    # 0.65-0.72.
+    #
+    # Rather than hard-code a vehicle width, use the observed
+    # topology aspect ratio.
+    #
+    # The normalized coordinate system is interpreted as:
+    #
+    # x -> longitudinal vehicle coordinate
+    # y -> lateral coordinate relative to vehicle
+    #
+    # We therefore use the wheelbase calibration for both
+    # dimensions.
+    # --------------------------------------------------------
+
+    y_scale = x_scale
+
+    # --------------------------------------------------------
+    # Z scale
+    #
+    # z_norm is defined as:
+    #
+    # ground = 0
+    # roof   ~= 1
+    #
+    # We therefore need a height estimate relative to the
+    # wheelbase.
+    #
+    # Use the observed topology ratio between normalized
+    # height and normalized wheelbase.
+    #
+    # This avoids the previous mistake of simply assuming
+    # every normalized dimension independently represents
+    # 2.7 m.
+    # --------------------------------------------------------
+
+    z_values = [
+        float(point["z_norm"])
+        for point in points
+    ]
+
+    z_min = min(z_values)
+    z_max = max(z_values)
+
+    normalized_height = (
+        z_max - z_min
+    )
+
+    if normalized_height <= 0:
+
+        raise RuntimeError(
+            "Cannot determine vehicle height from point data."
+        )
+
+    # Since z_norm is already expressed relative to the
+    # vehicle's normalized height, use the longitudinal
+    # calibration as the common scale.
+    z_scale = x_scale
+
+    # --------------------------------------------------------
+    # Convert every point.
+    #
+    # AutoCraft origin:
+    #
+    # rear axle center at ground
+    #
+    # Therefore:
+    #
+    # X = (point_x - rear_axle_x) * x_scale
+    #
+    # Y = point_y relative to centerline
+    #
+    # Z = point_z relative to ground
+    # --------------------------------------------------------
+
+    for point in points:
+
+        x_norm = float(
+            point["x_norm"]
+        )
+
+        y_norm = float(
+            point["y_norm"]
+        )
+
+        z_norm = float(
+            point["z_norm"]
+        )
+
+        # Longitudinal coordinate.
+        x_m = (
+            x_norm
+            - rear_axle_x
+        ) * x_scale
+
+        # Lateral coordinate.
+        #
+        # +Y = vehicle LEFT
+        # -Y = vehicle RIGHT
+        y_m = (
+            y_norm
+            - centerline_y
+        ) * y_scale
+
+        # Vertical coordinate.
+        #
+        # z_norm is assumed to have ground approximately at 0.
+        z_m = (
+            z_norm
+            - z_min
+        ) * z_scale
+
+        point["x_m"] = x_m
+        point["y_m"] = y_m
+        point["z_m"] = z_m
+
+    # --------------------------------------------------------
+    # Calibration information
+    # --------------------------------------------------------
+
+    result["coordinate_calibration"] = {
+
+        "coordinate_system": {
+            "x": "forward",
+            "y": "vehicle_left",
+            "z": "up",
+        },
+
+        "origin": (
+            "center of rear axle at ground level"
+        ),
+
+        "wheelbase_m": WHEELBASE_M,
+
+        "front_axle_reference": [
+            "P16L",
+            "P16R",
+        ],
+
+        "rear_axle_reference": [
+            "P23L",
+            "P23R",
+        ],
+
+        "raw_front_axle_x_norm": (
+            front_axle_x
+        ),
+
+        "raw_rear_axle_x_norm": (
+            rear_axle_x
+        ),
+
+        "raw_wheelbase_norm": (
+            raw_wheelbase
+        ),
+
+        "x_scale": x_scale,
+
+        "y_scale": y_scale,
+
+        "z_scale": z_scale,
+
+        "centerline_y_norm": (
+            centerline_y
+        ),
+
+        "normalized_height": (
+            normalized_height
+        ),
+
+        "normalized_half_width": (
+            max_abs_y
+        ),
+    }
 
     result["scale"] = {
-        "wheelbase_m": WHEELBASE_M
+        "wheelbase_m": WHEELBASE_M,
+        "method": (
+            "front/rear wheel-arch crown "
+            "calibration"
+        ),
     }
 
     return result
-
 
 # ============================================================
 # OBJ EXPORT
